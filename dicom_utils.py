@@ -41,14 +41,28 @@ def load_dicom_image(dicom_path, output_jpg_path):
     info["patient_name"] = str(get("PatientName"))
     info["patient_age"] = get("PatientAge")
     info["patient_sex"] = get("PatientSex")
-    info["visit_id"] = get("VisitID")
+    # VisitID 存储在私有标签中
+    visit_id = None
+    try:
+        visit_id = ds[(0x0011, 0x1010)].value if (0x0011, 0x1010) in ds else None
+    except Exception:
+        pass
+    info["visit_id"] = visit_id
     info["laterality"] = get("Laterality")  # 左/右眼 L/R
     info["image_orientation"] = get("ImageOrientationPatient")
-    info["device_model"] = get("ManufacturerModelName")
+    info["device_model"] = get("ManufacturerModelName")  # 标准 DICOM 标签 (0008,1090)
     info["manufacturer"] = get("Manufacturer")
     info["capture_time"] = get("AcquisitionTime")
     info["capture_date"] = get("AcquisitionDate")
-    info["field_of_view"] = get("FieldOfView")
+    # FieldOfView 存储在私有标签中
+    field_of_view = None
+    try:
+        fov_h = ds[(0x0019, 0x1008)].value if (0x0019, 0x1008) in ds else None
+        fov_v = ds[(0x0019, 0x1009)].value if (0x0019, 0x1009) in ds else None
+        field_of_view = fov_h or fov_v  # 优先使用水平 FOV
+    except Exception:
+        pass
+    info["field_of_view"] = field_of_view
 
     h, w = pixel_array.shape[:2]
     info["resolution"] = {"width": w, "height": h}

@@ -27,6 +27,19 @@ logger = logging.getLogger(__name__)
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+# ============ 工具函数：清理非 JSON 序列化对象 ============
+def make_json_safe(obj):
+    """递归清理对象中的 MultiValue 等非 JSON 序列化类型，转为基础类型"""
+    if isinstance(obj, dict):
+        return {k: make_json_safe(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [make_json_safe(item) for item in obj]
+    elif isinstance(obj, (str, int, float, bool, type(None))):
+        return obj
+    else:
+        # 将其他类型转为字符串
+        return str(obj)
+
 # ============ 加载模型 ============
 model = load_model("eye_disease_model.keras")
 class_names = ['amd', 'cataract', 'diabetes', 'normal']
@@ -347,8 +360,10 @@ def predict_v4():
             except Exception:
                 val = None
         try:
-            return float(val) if val is not None and val != "" else default
-        except Exception:
+            # 将值强制转为字符串，处理 MultiValue 等特殊类型
+            val_str = str(val).strip() if val is not None else None
+            return float(val_str) if val_str and val_str != "" else default
+        except (ValueError, TypeError):
             return default
 
     # 支持通用 min_val/max_val/alpha，如果未提供具体 coarse/amd 参数，则回退使用通用参数
@@ -455,7 +470,7 @@ def predict_v4():
     if is_dicom:
         coarse_result["lesion_mm2"] = coarse_result["lesion_px"] * pixel_spacing_x * pixel_spacing_y
 
-    return jsonify({
+    response_data = {
         "mode": "dicom" if is_dicom else "image",
         "dicom_metadata": dicom_meta,
         "coarse_model": coarse_result,
@@ -463,7 +478,11 @@ def predict_v4():
         "pixel_spacing_x_mm": pixel_spacing_x,
         "pixel_spacing_y_mm": pixel_spacing_y,
         "model_version": model_version
-    })
+    }
+    
+    # 清理非 JSON 序列化对象
+    response_data = make_json_safe(response_data)
+    return jsonify(response_data)
 
 # ============ 启动服务 ============
 if __name__ == "__main__":
