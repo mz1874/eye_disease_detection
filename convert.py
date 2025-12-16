@@ -104,7 +104,7 @@ def convert_image_to_dicom(
 # === 使用示例 ===
 os.makedirs("dicom_outputs", exist_ok=True)
 convert_image_to_dicom(
-    "uploads/2.jpg",
+    "uploads/983131418_R_1_.png",
     "dicom_outputs/fundus_example.dcm",
     pixel_spacing=(0.014, 0.014)  # ⭐ 这里随便你测试
 )

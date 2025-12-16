@@ -60,6 +60,76 @@ def preprocess_image(img_path):
     img_array = tf.image.resize_with_pad(img_array, *input_shape)
     return np.expand_dims(img_array, axis=0)
 
+def compute_iqa_metrics(img_path):
+    """
+    轻量级图像质量评估（IQA）函数：
+    - 依据清晰度（锐度）、曝光（过曝/欠曝）、对比度三个维度，计算一组指标和综合评分。
+    - 返回内容包括：
+      * iqa_score: 综合评分（0-100），分数越高质量越好。
+      * quality_label: 质量等级（good / fair / poor）。
+      * metrics: 详细的指标数值（sharpness、brightness、exposure、contrast）。
+    注意：该方法为无参考轻量级评估，适合在线推理快速筛查；如需更高精度可引入 BRISQUE/NIQE 或训练专用模型。
+    """
+    img = cv2.imread(img_path)
+    if img is None:
+        return {
+            "iqa_score": 0,
+            "quality_label": "poor",
+            "metrics": {
+                "sharpness": 0,
+                "brightness_mean": None,
+                "brightness_std": None,
+                "exposure_over_pct": None,
+                "exposure_under_pct": None,
+                "contrast_rms": None
+            }
+        }
+
+    # 转灰度以便进行亮度、对比度与锐度计算
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # 清晰度（锐度）：使用拉普拉斯算子方差衡量边缘强度（数值越大越清晰）
+    lap = cv2.Laplacian(gray, cv2.CV_64F)
+    sharpness = float(lap.var())
+
+    # 亮度与曝光：统计平均亮度、亮度标准差，以及过曝/欠曝像素比例
+    brightness_mean = float(gray.mean())
+    brightness_std = float(gray.std())
+    over_thresh = 240  # 过曝阈值（灰度≥240视为过曝）
+    under_thresh = 15  # 欠曝阈值（灰度≤15视为欠曝）
+    total = gray.size
+    exposure_over_pct = float((gray >= over_thresh).sum()) / total
+    exposure_under_pct = float((gray <= under_thresh).sum()) / total
+
+    # 对比度：RMS 对比度（亮度相对均值的均方根）
+    contrast_rms = float(np.sqrt(np.mean((gray - brightness_mean) ** 2)))
+
+    # 综合评分启发式：
+    # - 锐度占比 40 分（按 sharpness/300 折算，封顶 1.0）
+    # - 对比度占比 30 分（按 contrast_rms/50 折算，封顶 1.0）
+    # - 曝光占比 30 分（过曝+欠曝作为惩罚项，越少越好）
+    score = 0.0
+    score += min(sharpness / 300.0, 1.0) * 40.0
+    score += min(contrast_rms / 50.0, 1.0) * 30.0
+    exposure_penalty = min(exposure_over_pct + exposure_under_pct, 1.0)
+    score += (1.0 - exposure_penalty) * 30.0
+    iqa_score = int(round(max(0.0, min(100.0, score))))
+    # 质量等级划分：≥70 为 good，≥40 为 fair，其余为 poor
+    quality_label = "good" if iqa_score >= 70 else ("fair" if iqa_score >= 40 else "poor")
+
+    return {
+        "iqa_score": iqa_score,
+        "quality_label": quality_label,
+        "metrics": {
+            "sharpness": round(sharpness, 4),
+            "brightness_mean": round(brightness_mean, 4),
+            "brightness_std": round(brightness_std, 4),
+            "exposure_over_pct": round(exposure_over_pct, 6),
+            "exposure_under_pct": round(exposure_under_pct, 6),
+            "contrast_rms": round(contrast_rms, 4)
+        }
+    }
+
 def make_gradcam_heatmap(img_array, base_model, last_conv_layer_name, pred_index=None):
     """
     img_array: (1,H,W,3) 经过 preprocess_input
@@ -110,6 +180,24 @@ def extract_lesion_area_px(heatmap, threshold=0.6):
     logger.info(f"[Lesion] lesion_area_px={area}")
     return area
 
+def analyze_lesion_regions(heatmap, threshold=0.6, mm2_per_px=None):
+    """计算病灶连通域数量与最大单灶面积（像素/可选 mm²）。
+    - threshold: 热力图阈值。
+    - mm2_per_px: 每像素对应的 mm²（DICOM: spacing_x*spacing_y；非 DICOM: 近似换算）。
+    返回: count, max_px, max_mm2
+    """
+    mask = (heatmap >= threshold).astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    # stats: [label, left, top, width, height, area]
+    # label 0 是背景
+    if num_labels <= 1:
+        return 0, 0, 0.0
+    areas = stats[1:, cv2.CC_STAT_AREA]  # 排除背景
+    max_px = int(areas.max())
+    count = int(len(areas))
+    max_mm2 = float(max_px * mm2_per_px) if mm2_per_px is not None else 0.0
+    return count, max_px, max_mm2
+
 def generate_heatmap_base64(img_path, heatmap, alpha=0.6, min_val=None, max_val=None):
     # 使用动态归一化，并在彩色原图上叠加，提升可视化
     img = cv2.imread(img_path)
@@ -143,8 +231,9 @@ def generate_heatmap_base64(img_path, heatmap, alpha=0.6, min_val=None, max_val=
     b64 = base64.b64encode(buffer).decode("utf-8")
     return "data:image/jpeg;base64," + b64
 
-def predict_image_with_heatmap(img_path, min_val=None, max_val=None, fov=45.0, eye_d=12.0):
-    logger.info(f"[Predict] img_path={img_path}, fov={fov}, eye_d={eye_d}, min_val={min_val}, max_val={max_val}")
+def predict_image_with_heatmap(img_path, min_val=None, max_val=None, fov=45.0, eye_d=12.0, mm2_per_px=None):
+    """计算粗分模型的预测、热力图与病灶统计（可选 DICOM mm² 换算）。"""
+    logger.info(f"[Predict] img_path={img_path}, fov={fov}, eye_d={eye_d}, min_val={min_val}, max_val={max_val}, mm2_per_px={mm2_per_px}")
     img_array = preprocess_image(img_path)
 
     preds = model.predict(img_array)
@@ -169,17 +258,37 @@ def predict_image_with_heatmap(img_path, min_val=None, max_val=None, fov=45.0, e
     else:
         h, w = img.shape[:2]
 
-    lesion_mm2 = 0 if w == 0 else (lesion_px * (eye_d * (fov / 45.0) / w) ** 2)
-    logger.info(f"[Predict] image width={w}, lesion_mm2_estimate={lesion_mm2:.6f}")
+    # 优先使用 DICOM 像素间距换算 mm²，否则退回基于 fov/眼径的近似计算
+    if mm2_per_px is None:
+        mm2_per_px = (eye_d * (fov / 45.0) / w) ** 2 if w != 0 else 0.0
+    lesion_mm2 = lesion_px * mm2_per_px if mm2_per_px else 0.0
+    lesion_count, max_lesion_px, max_lesion_mm2 = analyze_lesion_regions(
+        heatmap, threshold=0.6, mm2_per_px=mm2_per_px
+    )
+    logger.info(
+        f"[Predict] width={w}, lesion_mm2_estimate={lesion_mm2:.6f}, "
+        f"regions={lesion_count}, max_px={max_lesion_px}, max_mm2={max_lesion_mm2:.6f}"
+    )
 
     heatmap_b64 = generate_heatmap_base64(img_path, heatmap, alpha=0.6, min_val=min_val, max_val=max_val)
     original_b64 = encode_image_base64(img_path)
 
-    return predicted_label, confidence, original_b64, heatmap_b64, lesion_px, lesion_mm2
+    return (
+        predicted_label,
+        confidence,
+        original_b64,
+        heatmap_b64,
+        lesion_px,
+        lesion_mm2,
+        lesion_count,
+        max_lesion_px,
+        max_lesion_mm2,
+    )
 
 # ===========使用 PixelSpacing ==========
 @app.route('/predict_v3', methods=['POST'])
 def predict_v3():
+    """DICOM 支持的病灶面积估计（PixelSpacing 必须存在），返回热力图和面积统计。"""
     if 'file' not in request.files:
         return jsonify({'error': 'No file uploaded'}), 400
 
@@ -209,10 +318,24 @@ def predict_v3():
             dicom_info = load_dicom_image(file_path, jpg_path)
             logger.info(f"[v3] Converted DICOM to JPEG at {jpg_path}")
 
-            label, confidence, original_b64, heatmap_b64, area_px, _ = \
-                predict_image_with_heatmap(jpg_path, 0.0, 1.0, 45.0, 12.0)
-
-            lesion_area_mm2 = area_px * spacing_x * spacing_y
+            (
+                label,
+                confidence,
+                original_b64,
+                heatmap_b64,
+                area_px,
+                lesion_area_mm2,
+                lesion_count,
+                max_lesion_px,
+                max_lesion_mm2,
+            ) = predict_image_with_heatmap(
+                jpg_path,
+                0.0,
+                1.0,
+                45.0,
+                12.0,
+                mm2_per_px=spacing_x * spacing_y,
+            )
             logger.info(f"[v3] lesion_area_px={area_px}, lesion_area_mm2={lesion_area_mm2:.6f}")
 
             return jsonify({
@@ -222,6 +345,9 @@ def predict_v3():
                 "confidence": round(confidence, 4),
                 "lesion_area_px": area_px,
                 "lesion_area_mm2": round(lesion_area_mm2, 6),
+                "lesion_region_count": lesion_count,
+                "max_lesion_area_px": max_lesion_px,
+                "max_lesion_area_mm2": round(max_lesion_mm2, 6),
                 "pixel_spacing_x_mm": spacing_x,
                 "pixel_spacing_y_mm": spacing_y,
                 "original_base64": original_b64,
@@ -234,8 +360,17 @@ def predict_v3():
 
     if ext in ["jpg", "jpeg", "png"]:
         try:
-            label, confidence, original_b64, heatmap_b64, area_px, lesion_area_mm2 = \
-                predict_image_with_heatmap(file_path, 0.6, 1.0, 45.0, 12.0)
+            (
+                label,
+                confidence,
+                original_b64,
+                heatmap_b64,
+                area_px,
+                lesion_area_mm2,
+                lesion_count,
+                max_lesion_px,
+                max_lesion_mm2,
+            ) = predict_image_with_heatmap(file_path, 0.6, 1.0, 45.0, 12.0)
             logger.info(f"[v3] image mode: lesion_area_px={area_px}, lesion_area_mm2={lesion_area_mm2:.6f}")
 
             return jsonify({
@@ -244,6 +379,9 @@ def predict_v3():
                 "confidence": round(confidence, 4),
                 "lesion_area_px": area_px,
                 "lesion_area_mm2": round(lesion_area_mm2, 6),
+                "lesion_region_count": lesion_count,
+                "max_lesion_area_px": max_lesion_px,
+                "max_lesion_area_mm2": round(max_lesion_mm2, 6),
                 "original_base64": original_b64,
                 "heatmap_base64": heatmap_b64
             })
@@ -290,15 +428,17 @@ def predict_simple():
         label = class_names[predicted_idx]
         confidence = float(np.max(preds))
         logger.info(f"[predict] label={label}, confidence={confidence:.6f}")
+        iqa = compute_iqa_metrics(img_path)
         return jsonify({
             "prediction": label,
-            "confidence": round(confidence, 4)
+            "confidence": round(confidence, 4),
+            "iqa_result": iqa
         })
     except Exception as e:
         logger.exception("[predict] Inference error")
         return jsonify({"error": f"Inference error: {str(e)}"}), 500
 
-def predict_single_model(img_path, model, class_names, min_val=None, max_val=None, fov=45.0, eye_d=12.0):
+def predict_single_model(img_path, model, class_names, min_val=None, max_val=None, fov=45.0, eye_d=12.0, mm2_per_px=None):
     img_array = preprocess_image(img_path)
 
     preds = model.predict(img_array)
@@ -321,7 +461,12 @@ def predict_single_model(img_path, model, class_names, min_val=None, max_val=Non
         w = 1
     else:
         h, w = img.shape[:2]
-    lesion_mm2 = 0 if w == 0 else (lesion_px * (eye_d * (fov / 45.0) / w) ** 2)
+    if mm2_per_px is None:
+        mm2_per_px = (eye_d * (fov / 45.0) / w) ** 2 if w != 0 else 0.0
+    lesion_mm2 = lesion_px * mm2_per_px if mm2_per_px else 0.0
+    lesion_count, max_lesion_px, max_lesion_mm2 = analyze_lesion_regions(
+        heatmap, threshold=0.6, mm2_per_px=mm2_per_px
+    )
 
     heatmap_b64 = generate_heatmap_base64(img_path, heatmap, alpha=0.6, min_val=min_val, max_val=max_val)
     original_b64 = encode_image_base64(img_path)
@@ -332,11 +477,15 @@ def predict_single_model(img_path, model, class_names, min_val=None, max_val=Non
         "heatmap_base64": heatmap_b64,
         "original_base64": original_b64,
         "lesion_px": lesion_px,
-        "lesion_mm2": lesion_mm2
+        "lesion_mm2": lesion_mm2,
+        "lesion_region_count": lesion_count,
+        "max_lesion_area_px": max_lesion_px,
+        "max_lesion_area_mm2": max_lesion_mm2,
     }
 
 @app.route('/predict_v4', methods=['POST'])
 def predict_v4():
+    """多模型推理端点：可调热力图归一化，支持 DICOM/mm² 换算与连通域统计。"""
     if 'file' not in request.files:
         return jsonify({'error': 'No file uploaded'}), 400
 
@@ -417,7 +566,8 @@ def predict_v4():
         min_val=coarse_min_val,
         max_val=coarse_max_val,
         fov=input_fov,
-        eye_d=eye_diameter_mm
+        eye_d=eye_diameter_mm,
+        mm2_per_px=(pixel_spacing_x * pixel_spacing_y) if is_dicom else None,
     )
     logger.info(f"[v4] Coarse model: label={coarse_result['label']}, conf={coarse_result['confidence']:.6f}, lesion_px={coarse_result['lesion_px']}, lesion_mm2={coarse_result['lesion_mm2']:.6f}")
 
@@ -449,26 +599,41 @@ def predict_v4():
     lesion_px = extract_lesion_area_px(heatmap, threshold=0.6)
     heatmap_b64 = generate_heatmap_base64(img_path, heatmap, alpha=amd_alpha, min_val=amd_min_val, max_val=amd_max_val)
 
-    lesion_mm2 = lesion_px
+    # AMD 分期病灶面积与连通域统计
     if is_dicom:
-        lesion_mm2 *= pixel_spacing_x * pixel_spacing_y
-        logger.info(f"[v4] AMD lesion_mm2 (dicom)={lesion_mm2:.6f}")
+        mm2_per_px_amd = pixel_spacing_x * pixel_spacing_y
+        logger.info(f"[v4] AMD using DICOM mm2_per_px={mm2_per_px_amd:.6f}")
     else:
         img_cv = cv2.imread(img_path)
         w = 1 if img_cv is None else img_cv.shape[1]
-        lesion_mm2 = 0 if w == 0 else lesion_px * (eye_diameter_mm * (input_fov / 45.0) / w) ** 2
-        logger.info(f"[v4] AMD lesion_mm2 (image)={lesion_mm2:.6f}, width={w}")
+        mm2_per_px_amd = (eye_diameter_mm * (input_fov / 45.0) / w) ** 2 if w != 0 else 0.0
+        logger.info(f"[v4] AMD using image mm2_per_px={mm2_per_px_amd:.6f}")
+
+    lesion_mm2 = lesion_px * mm2_per_px_amd if mm2_per_px_amd else 0.0
+    lesion_count, max_lesion_px, max_lesion_mm2 = analyze_lesion_regions(
+        heatmap, threshold=0.6, mm2_per_px=mm2_per_px_amd
+    )
+    logger.info(
+        f"[v4] AMD lesions: px={lesion_px}, mm2={lesion_mm2:.6f}, "
+        f"regions={lesion_count}, max_px={max_lesion_px}, max_mm2={max_lesion_mm2:.6f}"
+    )
 
     amd_stage_result = {
         "label": predicted_label,
         "confidence": confidence,
         "lesion_px": lesion_px,
         "lesion_mm2": lesion_mm2,
+        "lesion_region_count": lesion_count,
+        "max_lesion_area_px": max_lesion_px,
+        "max_lesion_area_mm2": max_lesion_mm2,
         "heatmap_base64": heatmap_b64
     }
 
     if is_dicom:
         coarse_result["lesion_mm2"] = coarse_result["lesion_px"] * pixel_spacing_x * pixel_spacing_y
+
+    # IQA：对输入图像（DICOM 会使用转换后的 JPEG）进行质量评估
+    iqa = compute_iqa_metrics(img_path)
 
     response_data = {
         "mode": "dicom" if is_dicom else "image",
@@ -477,7 +642,8 @@ def predict_v4():
         "amd_stage_model": amd_stage_result,
         "pixel_spacing_x_mm": pixel_spacing_x,
         "pixel_spacing_y_mm": pixel_spacing_y,
-        "model_version": model_version
+        "model_version": model_version,
+        "iqa_result": iqa
     }
     
     # 清理非 JSON 序列化对象
