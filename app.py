@@ -680,7 +680,7 @@ def predict_v4():
             "heatmap_base64": None,
         }
     else:
-        img = load_img(img_path, target_size=(224,224))
+        img = load_img(img_path, target_size=(300,300))
         img_array = img_to_array(img)
         img_array = np.expand_dims(img_array, axis=0)
         img_array = preprocess_input(img_array)
