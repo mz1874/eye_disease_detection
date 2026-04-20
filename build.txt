@@ -1,3 +1,5 @@
 docker buildx create --use
 docker buildx build --platform linux/amd64 -t mz1874/lumiq:latest --push .
 RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
+docker build --platform linux/amd64 -t eye-disease-detection .
+docker tag eye-disease-detection:latest sgccr.ccs.tencentyun.com/crm-xin/crm-model:latest

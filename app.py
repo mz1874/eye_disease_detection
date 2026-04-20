@@ -41,11 +41,30 @@ def make_json_safe(obj):
         return str(obj)
 
 # ============ 加载模型 ============
-model = load_model("eye_disease_model.keras")
-class_names = ['amd', 'cataract', 'diabetes', 'normal']
-base_model = model.layers[0]
+model = load_model("eye_disease_model.keras", compile=False)
+class_index_to_name = {
+    0: "Normal",
+    1: "Diabetes",
+    2: "Glaucoma",
+    3: "Cataract",
+    4: "AMD",
+    5: "Hypertension",
+    6: "Pathological Myopia",
+    7: "Other",
+}
+class_names = [class_index_to_name[i] for i in sorted(class_index_to_name.keys())]
+default_multilabel_threshold = float(os.environ.get("MULTILABEL_THRESHOLD", "0.5"))
 
-amd_stage_model = load_model("best_amd_resnet50_finetune.keras")
+amd_stage_model_path = os.environ.get("AMD_STAGE_MODEL_PATH", "best_amd_resnet50_finetune.keras")
+if os.path.exists(amd_stage_model_path):
+    amd_stage_model = load_model(amd_stage_model_path, compile=False)
+    logger.info("AMD stage model loaded from %s", amd_stage_model_path)
+else:
+    amd_stage_model = None
+    logger.warning(
+        "AMD stage model file not found: %s. AMD stage prediction will be disabled.",
+        amd_stage_model_path,
+    )
 amd_stage_classes = ['normal', 'early', 'intermediate_late']
 
 # ============ 工具函数 ============
@@ -59,6 +78,46 @@ def preprocess_image(img_path):
     img_array = img_to_array(img) / 255.0
     img_array = tf.image.resize_with_pad(img_array, *input_shape)
     return np.expand_dims(img_array, axis=0)
+
+def decode_multilabel_predictions(preds, threshold=default_multilabel_threshold):
+    """解析多标签模型输出，返回 top1 与阈值命中标签。"""
+    values = np.asarray(preds).squeeze()
+    if values.ndim != 1:
+        raise ValueError(f"Unexpected prediction shape: {np.asarray(preds).shape}")
+
+    # 若输出不是概率范围，按 logits 进行 sigmoid 变换
+    if np.min(values) < 0.0 or np.max(values) > 1.0:
+        probs = 1.0 / (1.0 + np.exp(-values))
+    else:
+        probs = values
+
+    usable_count = min(len(class_names), probs.shape[0])
+    if usable_count != len(class_names):
+        logger.warning(
+            "Prediction vector size (%s) does not match class count (%s); using first %s values.",
+            probs.shape[0],
+            len(class_names),
+            usable_count,
+        )
+
+    probs = probs[:usable_count]
+    labels = class_names[:usable_count]
+
+    top_idx = int(np.argmax(probs))
+    top_label = labels[top_idx]
+    top_conf = float(probs[top_idx])
+
+    probabilities = {labels[i]: round(float(probs[i]), 6) for i in range(usable_count)}
+    positive_labels = [labels[i] for i in range(usable_count) if float(probs[i]) >= threshold]
+
+    return {
+        "top_idx": top_idx,
+        "top_label": top_label,
+        "top_confidence": top_conf,
+        "probabilities": probabilities,
+        "positive_labels": positive_labels,
+        "threshold": float(threshold),
+    }
 
 def compute_iqa_metrics(img_path):
     """
@@ -158,6 +217,7 @@ def make_gradcam_heatmap(img_array, base_model, last_conv_layer_name, pred_index
     grads = tape.gradient(class_channel, conv_outputs)
     if grads is None:
         logger.warning("[GradCAM] grads is None — gradient could not be computed.")
+        return np.zeros((img_array.shape[1], img_array.shape[2]), dtype=np.float32)
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
     conv_outputs = conv_outputs[0]
 
@@ -172,6 +232,25 @@ def make_gradcam_heatmap(img_array, base_model, last_conv_layer_name, pred_index
         heatmap = heatmap / max_val
     logger.info(f"[GradCAM] heatmap stats: max={float(tf.math.reduce_max(heatmap)):.6f}, min={float(tf.math.reduce_min(heatmap)):.6f}, mean={float(tf.math.reduce_mean(heatmap)):.6f}")
     return heatmap.numpy()
+
+def find_last_conv_layer_target(model_obj):
+    """返回 (承载层模型, 最后一个 Conv2D 层名)，找不到则返回 (None, None)。"""
+    if not hasattr(model_obj, "layers"):
+        return None, None
+
+    # 优先在当前模型层级寻找最后一个 Conv2D
+    for layer in reversed(model_obj.layers):
+        if isinstance(layer, tf.keras.layers.Conv2D):
+            return model_obj, layer.name
+
+    # 若当前层级没有，则递归进入嵌套模型/层容器
+    for layer in reversed(model_obj.layers):
+        if hasattr(layer, "layers") and len(getattr(layer, "layers", [])) > 0:
+            nested_model, nested_name = find_last_conv_layer_target(layer)
+            if nested_model is not None and nested_name is not None:
+                return nested_model, nested_name
+
+    return None, None
 
 def extract_lesion_area_px(heatmap, threshold=0.6):
     logger.info(f"[Lesion] Threshold={threshold}")
@@ -231,25 +310,25 @@ def generate_heatmap_base64(img_path, heatmap, alpha=0.6, min_val=None, max_val=
     b64 = base64.b64encode(buffer).decode("utf-8")
     return "data:image/jpeg;base64," + b64
 
-def predict_image_with_heatmap(img_path, min_val=None, max_val=None, fov=45.0, eye_d=12.0, mm2_per_px=None):
+def predict_image_with_heatmap(img_path, min_val=None, max_val=None, fov=45.0, eye_d=12.0, mm2_per_px=None, threshold=default_multilabel_threshold):
     """计算粗分模型的预测、热力图与病灶统计（可选 DICOM mm² 换算）。"""
     logger.info(f"[Predict] img_path={img_path}, fov={fov}, eye_d={eye_d}, min_val={min_val}, max_val={max_val}, mm2_per_px={mm2_per_px}")
     img_array = preprocess_image(img_path)
 
     preds = model.predict(img_array)
-    predicted_idx = np.argmax(preds, axis=1)[0]
-    predicted_label = class_names[predicted_idx]
-    confidence = float(np.max(preds))
+    decoded = decode_multilabel_predictions(preds[0], threshold=threshold)
+    predicted_idx = decoded["top_idx"]
+    predicted_label = decoded["top_label"]
+    confidence = decoded["top_confidence"]
     logger.info(f"[Predict] coarse label={predicted_label}, confidence={confidence:.6f}")
 
-    last_conv_layer_name = None
-    for layer in reversed(base_model.layers):
-        if isinstance(layer, tf.keras.layers.Conv2D):
-            last_conv_layer_name = layer.name
-            break
+    gradcam_model, last_conv_layer_name = find_last_conv_layer_target(model)
     logger.info(f"[Predict] selected last_conv_layer_name={last_conv_layer_name}")
-
-    heatmap = make_gradcam_heatmap(img_array, base_model, last_conv_layer_name, predicted_idx)
+    if gradcam_model is None or last_conv_layer_name is None:
+        logger.warning("[Predict] No Conv2D layer found for Grad-CAM. Using zero heatmap.")
+        heatmap = np.zeros((img_array.shape[1], img_array.shape[2]), dtype=np.float32)
+    else:
+        heatmap = make_gradcam_heatmap(img_array, gradcam_model, last_conv_layer_name, predicted_idx)
     lesion_px = extract_lesion_area_px(heatmap, threshold=0.6)
 
     img = cv2.imread(img_path)
@@ -273,17 +352,20 @@ def predict_image_with_heatmap(img_path, min_val=None, max_val=None, fov=45.0, e
     heatmap_b64 = generate_heatmap_base64(img_path, heatmap, alpha=0.6, min_val=min_val, max_val=max_val)
     original_b64 = encode_image_base64(img_path)
 
-    return (
-        predicted_label,
-        confidence,
-        original_b64,
-        heatmap_b64,
-        lesion_px,
-        lesion_mm2,
-        lesion_count,
-        max_lesion_px,
-        max_lesion_mm2,
-    )
+    return {
+        "prediction": predicted_label,
+        "confidence": confidence,
+        "multilabel_probabilities": decoded["probabilities"],
+        "multilabel_positive_labels": decoded["positive_labels"],
+        "multilabel_threshold": decoded["threshold"],
+        "original_base64": original_b64,
+        "heatmap_base64": heatmap_b64,
+        "lesion_area_px": lesion_px,
+        "lesion_area_mm2": lesion_mm2,
+        "lesion_region_count": lesion_count,
+        "max_lesion_area_px": max_lesion_px,
+        "max_lesion_area_mm2": max_lesion_mm2,
+    }
 
 # ===========使用 PixelSpacing ==========
 @app.route('/predict_v3', methods=['POST'])
@@ -298,6 +380,12 @@ def predict_v3():
     file.save(file_path)
 
     ext = filename.lower().split('.')[-1]
+
+    threshold = request.form.get("threshold", default_multilabel_threshold)
+    try:
+        threshold = float(threshold)
+    except (ValueError, TypeError):
+        threshold = default_multilabel_threshold
 
     if ext == "dcm":
         try:
@@ -318,40 +406,37 @@ def predict_v3():
             dicom_info = load_dicom_image(file_path, jpg_path)
             logger.info(f"[v3] Converted DICOM to JPEG at {jpg_path}")
 
-            (
-                label,
-                confidence,
-                original_b64,
-                heatmap_b64,
-                area_px,
-                lesion_area_mm2,
-                lesion_count,
-                max_lesion_px,
-                max_lesion_mm2,
-            ) = predict_image_with_heatmap(
+            result = predict_image_with_heatmap(
                 jpg_path,
                 0.0,
                 1.0,
                 45.0,
                 12.0,
                 mm2_per_px=spacing_x * spacing_y,
+                threshold=threshold,
             )
-            logger.info(f"[v3] lesion_area_px={area_px}, lesion_area_mm2={lesion_area_mm2:.6f}")
+            logger.info(
+                f"[v3] lesion_area_px={result['lesion_area_px']}, "
+                f"lesion_area_mm2={result['lesion_area_mm2']:.6f}"
+            )
 
             return jsonify({
                 "mode": "dicom",
                 "dicom_metadata": dicom_info,
-                "prediction": label,
-                "confidence": round(confidence, 4),
-                "lesion_area_px": area_px,
-                "lesion_area_mm2": round(lesion_area_mm2, 6),
-                "lesion_region_count": lesion_count,
-                "max_lesion_area_px": max_lesion_px,
-                "max_lesion_area_mm2": round(max_lesion_mm2, 6),
+                "prediction": result["prediction"],
+                "confidence": round(result["confidence"], 4),
+                "multilabel_probabilities": result["multilabel_probabilities"],
+                "multilabel_positive_labels": result["multilabel_positive_labels"],
+                "multilabel_threshold": result["multilabel_threshold"],
+                "lesion_area_px": result["lesion_area_px"],
+                "lesion_area_mm2": round(result["lesion_area_mm2"], 6),
+                "lesion_region_count": result["lesion_region_count"],
+                "max_lesion_area_px": result["max_lesion_area_px"],
+                "max_lesion_area_mm2": round(result["max_lesion_area_mm2"], 6),
                 "pixel_spacing_x_mm": spacing_x,
                 "pixel_spacing_y_mm": spacing_y,
-                "original_base64": original_b64,
-                "heatmap_base64": heatmap_b64
+                "original_base64": result["original_base64"],
+                "heatmap_base64": result["heatmap_base64"]
             })
 
         except Exception as e:
@@ -360,30 +445,26 @@ def predict_v3():
 
     if ext in ["jpg", "jpeg", "png"]:
         try:
-            (
-                label,
-                confidence,
-                original_b64,
-                heatmap_b64,
-                area_px,
-                lesion_area_mm2,
-                lesion_count,
-                max_lesion_px,
-                max_lesion_mm2,
-            ) = predict_image_with_heatmap(file_path, 0.6, 1.0, 45.0, 12.0)
-            logger.info(f"[v3] image mode: lesion_area_px={area_px}, lesion_area_mm2={lesion_area_mm2:.6f}")
+            result = predict_image_with_heatmap(file_path, 0.6, 1.0, 45.0, 12.0, threshold=threshold)
+            logger.info(
+                f"[v3] image mode: lesion_area_px={result['lesion_area_px']}, "
+                f"lesion_area_mm2={result['lesion_area_mm2']:.6f}"
+            )
 
             return jsonify({
                 "mode": "image",
-                "prediction": label,
-                "confidence": round(confidence, 4),
-                "lesion_area_px": area_px,
-                "lesion_area_mm2": round(lesion_area_mm2, 6),
-                "lesion_region_count": lesion_count,
-                "max_lesion_area_px": max_lesion_px,
-                "max_lesion_area_mm2": round(max_lesion_mm2, 6),
-                "original_base64": original_b64,
-                "heatmap_base64": heatmap_b64
+                "prediction": result["prediction"],
+                "confidence": round(result["confidence"], 4),
+                "multilabel_probabilities": result["multilabel_probabilities"],
+                "multilabel_positive_labels": result["multilabel_positive_labels"],
+                "multilabel_threshold": result["multilabel_threshold"],
+                "lesion_area_px": result["lesion_area_px"],
+                "lesion_area_mm2": round(result["lesion_area_mm2"], 6),
+                "lesion_region_count": result["lesion_region_count"],
+                "max_lesion_area_px": result["max_lesion_area_px"],
+                "max_lesion_area_mm2": round(result["max_lesion_area_mm2"], 6),
+                "original_base64": result["original_base64"],
+                "heatmap_base64": result["heatmap_base64"]
             })
 
         except Exception as e:
@@ -424,36 +505,43 @@ def predict_simple():
     try:
         img_array = preprocess_image(img_path)
         preds = model.predict(img_array)
-        predicted_idx = int(np.argmax(preds, axis=1)[0])
-        label = class_names[predicted_idx]
-        confidence = float(np.max(preds))
+        threshold = request.form.get("threshold", default_multilabel_threshold)
+        try:
+            threshold = float(threshold)
+        except (ValueError, TypeError):
+            threshold = default_multilabel_threshold
+        decoded = decode_multilabel_predictions(preds[0], threshold=threshold)
+        label = decoded["top_label"]
+        confidence = decoded["top_confidence"]
         logger.info(f"[predict] label={label}, confidence={confidence:.6f}")
         iqa = compute_iqa_metrics(img_path)
         return jsonify({
             "prediction": label,
             "confidence": round(confidence, 4),
+            "multilabel_probabilities": decoded["probabilities"],
+            "multilabel_positive_labels": decoded["positive_labels"],
+            "multilabel_threshold": decoded["threshold"],
             "iqa_result": iqa
         })
     except Exception as e:
         logger.exception("[predict] Inference error")
         return jsonify({"error": f"Inference error: {str(e)}"}), 500
 
-def predict_single_model(img_path, model, class_names, min_val=None, max_val=None, fov=45.0, eye_d=12.0, mm2_per_px=None):
+def predict_single_model(img_path, model, class_names, min_val=None, max_val=None, fov=45.0, eye_d=12.0, mm2_per_px=None, threshold=default_multilabel_threshold):
     img_array = preprocess_image(img_path)
 
     preds = model.predict(img_array)
-    predicted_idx = np.argmax(preds, axis=1)[0]
-    predicted_label = class_names[predicted_idx]
-    confidence = float(np.max(preds))
+    decoded = decode_multilabel_predictions(preds[0], threshold=threshold)
+    predicted_idx = decoded["top_idx"]
+    predicted_label = decoded["top_label"]
+    confidence = decoded["top_confidence"]
 
-    base_model = model.layers[0]
-    last_conv_layer_name = None
-    for layer in reversed(base_model.layers):
-        if isinstance(layer, tf.keras.layers.Conv2D):
-            last_conv_layer_name = layer.name
-            break
-
-    heatmap = make_gradcam_heatmap(img_array, base_model, last_conv_layer_name, predicted_idx)
+    gradcam_model, last_conv_layer_name = find_last_conv_layer_target(model)
+    if gradcam_model is None or last_conv_layer_name is None:
+        logger.warning("[Predict] No Conv2D layer found for Grad-CAM. Using zero heatmap.")
+        heatmap = np.zeros((img_array.shape[1], img_array.shape[2]), dtype=np.float32)
+    else:
+        heatmap = make_gradcam_heatmap(img_array, gradcam_model, last_conv_layer_name, predicted_idx)
     lesion_px = extract_lesion_area_px(heatmap, threshold=0.6)
 
     img = cv2.imread(img_path)
@@ -474,6 +562,9 @@ def predict_single_model(img_path, model, class_names, min_val=None, max_val=Non
     return {
         "label": predicted_label,
         "confidence": confidence,
+        "multilabel_probabilities": decoded["probabilities"],
+        "multilabel_positive_labels": decoded["positive_labels"],
+        "multilabel_threshold": decoded["threshold"],
         "heatmap_base64": heatmap_b64,
         "original_base64": original_b64,
         "lesion_px": lesion_px,
@@ -514,6 +605,8 @@ def predict_v4():
             return float(val_str) if val_str and val_str != "" else default
         except (ValueError, TypeError):
             return default
+
+    multilabel_threshold = _get_float("threshold", default=default_multilabel_threshold)
 
     # 支持通用 min_val/max_val/alpha，如果未提供具体 coarse/amd 参数，则回退使用通用参数
     global_min_val = _get_float("min_val", default=None)
@@ -568,66 +661,81 @@ def predict_v4():
         fov=input_fov,
         eye_d=eye_diameter_mm,
         mm2_per_px=(pixel_spacing_x * pixel_spacing_y) if is_dicom else None,
+        threshold=multilabel_threshold,
     )
     logger.info(f"[v4] Coarse model: label={coarse_result['label']}, conf={coarse_result['confidence']:.6f}, lesion_px={coarse_result['lesion_px']}, lesion_mm2={coarse_result['lesion_mm2']:.6f}")
 
-    # AMD 分期模型预测
-    img = load_img(img_path, target_size=(224,224))
-    img_array = img_to_array(img)
-    img_array = np.expand_dims(img_array, axis=0)
-    img_array = preprocess_input(img_array)
-
-    logger.info("[v4] Running AMD stage model prediction")
-    preds = amd_stage_model.predict(img_array)
-    predicted_idx = np.argmax(preds, axis=1)[0]
-    predicted_label = amd_stage_classes[predicted_idx]
-    confidence = float(np.max(preds))
-    logger.info(f"[v4] AMD stage: label={predicted_label}, conf={confidence:.6f}")
-
-    base_model_layer = amd_stage_model.layers[0]
-    last_conv_layer_name = None
-    for layer in reversed(base_model_layer.layers):
-        if isinstance(layer, tf.keras.layers.Conv2D):
-            last_conv_layer_name = layer.name
-            break
-    logger.info(f"[v4] AMD stage last_conv_layer_name={last_conv_layer_name}")
-
-    heatmap = make_gradcam_heatmap(img_array, base_model_layer, last_conv_layer_name, predicted_idx)
-    max_val_local = np.max(heatmap)
-    heatmap = np.zeros_like(heatmap) if max_val_local == 0 else heatmap / max_val_local
-    logger.info(f"[v4] AMD heatmap stats: max={float(np.max(heatmap)):.6f}, min={float(np.min(heatmap)):.6f}, mean={float(np.mean(heatmap)):.6f}")
-    lesion_px = extract_lesion_area_px(heatmap, threshold=0.6)
-    heatmap_b64 = generate_heatmap_base64(img_path, heatmap, alpha=amd_alpha, min_val=amd_min_val, max_val=amd_max_val)
-
-    # AMD 分期病灶面积与连通域统计
-    if is_dicom:
-        mm2_per_px_amd = pixel_spacing_x * pixel_spacing_y
-        logger.info(f"[v4] AMD using DICOM mm2_per_px={mm2_per_px_amd:.6f}")
+    # AMD 分期模型预测（模型文件缺失时降级）
+    if amd_stage_model is None:
+        amd_stage_result = {
+            "status": "unavailable",
+            "message": f"AMD stage model file not found: {amd_stage_model_path}",
+            "label": None,
+            "confidence": None,
+            "lesion_px": None,
+            "lesion_mm2": None,
+            "lesion_region_count": None,
+            "max_lesion_area_px": None,
+            "max_lesion_area_mm2": None,
+            "heatmap_base64": None,
+        }
     else:
-        img_cv = cv2.imread(img_path)
-        w = 1 if img_cv is None else img_cv.shape[1]
-        mm2_per_px_amd = (eye_diameter_mm * (input_fov / 45.0) / w) ** 2 if w != 0 else 0.0
-        logger.info(f"[v4] AMD using image mm2_per_px={mm2_per_px_amd:.6f}")
+        img = load_img(img_path, target_size=(224,224))
+        img_array = img_to_array(img)
+        img_array = np.expand_dims(img_array, axis=0)
+        img_array = preprocess_input(img_array)
 
-    lesion_mm2 = lesion_px * mm2_per_px_amd if mm2_per_px_amd else 0.0
-    lesion_count, max_lesion_px, max_lesion_mm2 = analyze_lesion_regions(
-        heatmap, threshold=0.6, mm2_per_px=mm2_per_px_amd
-    )
-    logger.info(
-        f"[v4] AMD lesions: px={lesion_px}, mm2={lesion_mm2:.6f}, "
-        f"regions={lesion_count}, max_px={max_lesion_px}, max_mm2={max_lesion_mm2:.6f}"
-    )
+        logger.info("[v4] Running AMD stage model prediction")
+        preds = amd_stage_model.predict(img_array)
+        predicted_idx = np.argmax(preds, axis=1)[0]
+        predicted_label = amd_stage_classes[predicted_idx]
+        confidence = float(np.max(preds))
+        logger.info(f"[v4] AMD stage: label={predicted_label}, conf={confidence:.6f}")
 
-    amd_stage_result = {
-        "label": predicted_label,
-        "confidence": confidence,
-        "lesion_px": lesion_px,
-        "lesion_mm2": lesion_mm2,
-        "lesion_region_count": lesion_count,
-        "max_lesion_area_px": max_lesion_px,
-        "max_lesion_area_mm2": max_lesion_mm2,
-        "heatmap_base64": heatmap_b64
-    }
+        base_model_layer, last_conv_layer_name = find_last_conv_layer_target(amd_stage_model)
+        logger.info(f"[v4] AMD stage last_conv_layer_name={last_conv_layer_name}")
+        if base_model_layer is None or last_conv_layer_name is None:
+            logger.warning("[v4] No Conv2D layer found in AMD stage model. Using zero heatmap.")
+            heatmap = np.zeros((img_array.shape[1], img_array.shape[2]), dtype=np.float32)
+        else:
+            heatmap = make_gradcam_heatmap(img_array, base_model_layer, last_conv_layer_name, predicted_idx)
+        max_val_local = np.max(heatmap)
+        heatmap = np.zeros_like(heatmap) if max_val_local == 0 else heatmap / max_val_local
+        logger.info(f"[v4] AMD heatmap stats: max={float(np.max(heatmap)):.6f}, min={float(np.min(heatmap)):.6f}, mean={float(np.mean(heatmap)):.6f}")
+        lesion_px = extract_lesion_area_px(heatmap, threshold=0.6)
+        heatmap_b64 = generate_heatmap_base64(img_path, heatmap, alpha=amd_alpha, min_val=amd_min_val, max_val=amd_max_val)
+
+        # AMD 分期病灶面积与连通域统计
+        if is_dicom:
+            mm2_per_px_amd = pixel_spacing_x * pixel_spacing_y
+            logger.info(f"[v4] AMD using DICOM mm2_per_px={mm2_per_px_amd:.6f}")
+        else:
+            img_cv = cv2.imread(img_path)
+            w = 1 if img_cv is None else img_cv.shape[1]
+            mm2_per_px_amd = (eye_diameter_mm * (input_fov / 45.0) / w) ** 2 if w != 0 else 0.0
+            logger.info(f"[v4] AMD using image mm2_per_px={mm2_per_px_amd:.6f}")
+
+        lesion_mm2 = lesion_px * mm2_per_px_amd if mm2_per_px_amd else 0.0
+        lesion_count, max_lesion_px, max_lesion_mm2 = analyze_lesion_regions(
+            heatmap, threshold=0.6, mm2_per_px=mm2_per_px_amd
+        )
+        logger.info(
+            f"[v4] AMD lesions: px={lesion_px}, mm2={lesion_mm2:.6f}, "
+            f"regions={lesion_count}, max_px={max_lesion_px}, max_mm2={max_lesion_mm2:.6f}"
+        )
+
+        amd_stage_result = {
+            "status": "ok",
+            "message": None,
+            "label": predicted_label,
+            "confidence": confidence,
+            "lesion_px": lesion_px,
+            "lesion_mm2": lesion_mm2,
+            "lesion_region_count": lesion_count,
+            "max_lesion_area_px": max_lesion_px,
+            "max_lesion_area_mm2": max_lesion_mm2,
+            "heatmap_base64": heatmap_b64
+        }
 
     if is_dicom:
         coarse_result["lesion_mm2"] = coarse_result["lesion_px"] * pixel_spacing_x * pixel_spacing_y
