@@ -665,19 +665,19 @@ def predict_v4():
     )
     logger.info(f"[v4] Coarse model: label={coarse_result['label']}, conf={coarse_result['confidence']:.6f}, lesion_px={coarse_result['lesion_px']}, lesion_mm2={coarse_result['lesion_mm2']:.6f}")
 
-    # AMD 分期模型预测（模型文件缺失时降级）
+    # AMD 分期模型预测（模型文件缺失时降级为单一 AMD 标签）
     if amd_stage_model is None:
         amd_stage_result = {
-            "status": "unavailable",
-            "message": f"AMD stage model file not found: {amd_stage_model_path}",
-            "label": None,
-            "confidence": None,
-            "lesion_px": None,
-            "lesion_mm2": None,
-            "lesion_region_count": None,
-            "max_lesion_area_px": None,
-            "max_lesion_area_mm2": None,
-            "heatmap_base64": None,
+            "status": "downgrade",
+            "message": "AMD stage model not available, returning AMD as single label",
+            "label": "amd",
+            "confidence": coarse_result["confidence"] if coarse_result["label"] == "amd" else None,
+            "lesion_px": coarse_result.get("lesion_px"),
+            "lesion_mm2": coarse_result.get("lesion_mm2"),
+            "lesion_region_count": coarse_result.get("lesion_region_count"),
+            "max_lesion_area_px": coarse_result.get("max_lesion_area_px"),
+            "max_lesion_area_mm2": coarse_result.get("max_lesion_area_mm2"),
+            "heatmap_base64": coarse_result.get("heatmap_base64"),
         }
     else:
         img = load_img(img_path, target_size=(300,300))
@@ -688,6 +688,11 @@ def predict_v4():
         logger.info("[v4] Running AMD stage model prediction")
         preds = amd_stage_model.predict(img_array)
         predicted_idx = np.argmax(preds, axis=1)[0]
+        num_classes = preds.shape[1] if len(preds.shape) > 1 else preds.shape[0]
+        logger.info(f"[v4] Model output shape: {preds.shape}, num_classes: {num_classes}")
+        if predicted_idx >= len(amd_stage_classes):
+            logger.warning(f"[v4] predicted_idx {predicted_idx} >= len(amd_stage_classes) {len(amd_stage_classes)}, clamping to valid range")
+            predicted_idx = min(predicted_idx, len(amd_stage_classes) - 1)
         predicted_label = amd_stage_classes[predicted_idx]
         confidence = float(np.max(preds))
         logger.info(f"[v4] AMD stage: label={predicted_label}, conf={confidence:.6f}")
