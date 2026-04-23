@@ -54,6 +54,16 @@ class_index_to_name = {
 }
 class_names = [class_index_to_name[i] for i in sorted(class_index_to_name.keys())]
 default_multilabel_threshold = float(os.environ.get("MULTILABEL_THRESHOLD", "0.5"))
+multilabel_thresholds = {
+    "Normal": 0.66,
+    "Diabetes": 0.66,
+    "Glaucoma": 0.84,
+    "Cataract": 0.85,
+    "AMD": 0.83,
+    "Hypertension": 0.63,
+    "Pathological Myopia": 0.66,
+    "Other": 0.71,
+}
 
 amd_stage_model_path = os.environ.get("AMD_STAGE_MODEL_PATH", "best_amd_resnet50_finetune.keras")
 if os.path.exists(amd_stage_model_path):
@@ -108,7 +118,14 @@ def decode_multilabel_predictions(preds, threshold=default_multilabel_threshold)
     top_conf = float(probs[top_idx])
 
     probabilities = {labels[i]: round(float(probs[i]), 6) for i in range(usable_count)}
-    positive_labels = [labels[i] for i in range(usable_count) if float(probs[i]) >= threshold]
+    positive_labels = []
+    label_thresholds = {}
+    for i in range(usable_count):
+        label = labels[i]
+        label_threshold = float(multilabel_thresholds.get(label, threshold))
+        label_thresholds[label] = label_threshold
+        if float(probs[i]) >= label_threshold:
+            positive_labels.append(label)
 
     return {
         "top_idx": top_idx,
@@ -116,6 +133,7 @@ def decode_multilabel_predictions(preds, threshold=default_multilabel_threshold)
         "top_confidence": top_conf,
         "probabilities": probabilities,
         "positive_labels": positive_labels,
+        "label_thresholds": label_thresholds,
         "threshold": float(threshold),
     }
 
@@ -357,6 +375,7 @@ def predict_image_with_heatmap(img_path, min_val=None, max_val=None, fov=45.0, e
         "confidence": confidence,
         "multilabel_probabilities": decoded["probabilities"],
         "multilabel_positive_labels": decoded["positive_labels"],
+        "multilabel_label_thresholds": decoded["label_thresholds"],
         "multilabel_threshold": decoded["threshold"],
         "original_base64": original_b64,
         "heatmap_base64": heatmap_b64,
@@ -520,6 +539,7 @@ def predict_simple():
             "confidence": round(confidence, 4),
             "multilabel_probabilities": decoded["probabilities"],
             "multilabel_positive_labels": decoded["positive_labels"],
+            "multilabel_label_thresholds": decoded["label_thresholds"],
             "multilabel_threshold": decoded["threshold"],
             "iqa_result": iqa
         })
@@ -564,6 +584,7 @@ def predict_single_model(img_path, model, class_names, min_val=None, max_val=Non
         "confidence": confidence,
         "multilabel_probabilities": decoded["probabilities"],
         "multilabel_positive_labels": decoded["positive_labels"],
+        "multilabel_label_thresholds": decoded["label_thresholds"],
         "multilabel_threshold": decoded["threshold"],
         "heatmap_base64": heatmap_b64,
         "original_base64": original_b64,
