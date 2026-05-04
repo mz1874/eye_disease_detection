@@ -6,7 +6,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
-COPY eye_disease_model.keras app.py dicom_utils.py /app/
+COPY vgg16_model.keras app.py dicom_utils.py /app/
 
 # 创建上传目录（容器运行时存放上传文件）
 RUN mkdir -p /app/uploads
@@ -15,7 +15,7 @@ RUN mkdir -p /app/uploads
 EXPOSE 5000
 
 # 设置模型路径
-ENV AMD_STAGE_MODEL_PATH=eye_disease_model.keras
+ENV AMD_STAGE_MODEL_PATH=vgg16_model.keras
 
 # 启动 Flask 服务
 CMD ["python", "app.py"]
