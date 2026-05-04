@@ -41,41 +41,28 @@ def make_json_safe(obj):
         return str(obj)
 
 # ============ 加载模型 ============
-model = load_model("eye_disease_model.keras", compile=False)
+model = load_model("vgg16_model.keras", compile=False)
 class_index_to_name = {
-    0: "Normal",
-    1: "Diabetes",
-    2: "Glaucoma",
-    3: "Cataract",
-    4: "AMD",
-    5: "Hypertension",
-    6: "Pathological Myopia",
-    7: "Other",
+    0: "AMD",
+    1: "Cataracts",
+    2: "Diabetic Retinopathy",
+    3: "Glaucoma",
+    4: "Hypertension",
+    5: "Myopia",
+    6: "Normal",
 }
 class_names = [class_index_to_name[i] for i in sorted(class_index_to_name.keys())]
 default_multilabel_threshold = float(os.environ.get("MULTILABEL_THRESHOLD", "0.5"))
-multilabel_thresholds = {
-    "Normal": 0.66,
-    "Diabetes": 0.66,
-    "Glaucoma": 0.84,
-    "Cataract": 0.85,
-    "AMD": 0.83,
-    "Hypertension": 0.63,
-    "Pathological Myopia": 0.66,
-    "Other": 0.71,
-}
 
-amd_stage_model_path = os.environ.get("AMD_STAGE_MODEL_PATH", "best_amd_resnet50_finetune.keras")
-if os.path.exists(amd_stage_model_path):
-    amd_stage_model = load_model(amd_stage_model_path, compile=False)
-    logger.info("AMD stage model loaded from %s", amd_stage_model_path)
-else:
-    amd_stage_model = None
-    logger.warning(
-        "AMD stage model file not found: %s. AMD stage prediction will be disabled.",
-        amd_stage_model_path,
-    )
-amd_stage_classes = ['normal', 'early', 'intermediate_late']
+multilabel_thresholds = {
+    'AMD': 0.0702,   # Normal
+    'Cataracts': 0.2606,
+    'Diabetic Retinopathy': 0.3537,
+    'Glaucoma': 0.3566, 
+    'Hypertension': 0.2699,  
+    'Myopia': 0.2758, 
+    'Normal': 0.3399 
+}
 
 # ============ 工具函数 ============
 def encode_image_base64(img_path):
@@ -95,9 +82,18 @@ def decode_multilabel_predictions(preds, threshold=default_multilabel_threshold)
     if values.ndim != 1:
         raise ValueError(f"Unexpected prediction shape: {np.asarray(preds).shape}")
 
-    # 若输出不是概率范围，按 logits 进行 sigmoid 变换
+    # 判别输出类型：如果输出向量长度与类别数相等，且概率和接近 1，则视为单标签 softmax 多类输出
+    is_same_len = (values.shape[0] == len(class_names))
+
+    # 若数值不在 [0,1] 范围内，需要做变换：
+    # - 对于多类（same_len），更可能是 softmax logits -> 使用 softmax
+    # - 否则当作独立 logits -> 使用 sigmoid
     if np.min(values) < 0.0 or np.max(values) > 1.0:
-        probs = 1.0 / (1.0 + np.exp(-values))
+        if is_same_len:
+            exps = np.exp(values - np.max(values))
+            probs = exps / np.sum(exps)
+        else:
+            probs = 1.0 / (1.0 + np.exp(-values))
     else:
         probs = values
 
@@ -113,6 +109,7 @@ def decode_multilabel_predictions(preds, threshold=default_multilabel_threshold)
     probs = probs[:usable_count]
     labels = class_names[:usable_count]
 
+    # 单标签多类（softmax）时，只返回 top1 为正类；多标签时按阈值判断
     top_idx = int(np.argmax(probs))
     top_label = labels[top_idx]
     top_conf = float(probs[top_idx])
@@ -120,12 +117,21 @@ def decode_multilabel_predictions(preds, threshold=default_multilabel_threshold)
     probabilities = {labels[i]: round(float(probs[i]), 6) for i in range(usable_count)}
     positive_labels = []
     label_thresholds = {}
-    for i in range(usable_count):
-        label = labels[i]
-        label_threshold = float(multilabel_thresholds.get(label, threshold))
-        label_thresholds[label] = label_threshold
-        if float(probs[i]) >= label_threshold:
-            positive_labels.append(label)
+
+    if is_same_len and np.isclose(np.sum(probs), 1.0, atol=1e-3):
+        # 单标签输出：仅将 top1 视为正类
+        positive_labels = [top_label]
+        for i in range(usable_count):
+            label = labels[i]
+            label_thresholds[label] = float(multilabel_thresholds.get(label, threshold))
+    else:
+        # 多标签输出：使用阈值判定每个标签
+        for i in range(usable_count):
+            label = labels[i]
+            label_threshold = float(multilabel_thresholds.get(label, threshold))
+            label_thresholds[label] = label_threshold
+            if float(probs[i]) >= label_threshold:
+                positive_labels.append(label)
 
     return {
         "top_idx": top_idx,
@@ -228,8 +234,16 @@ def make_gradcam_heatmap(img_array, base_model, last_conv_layer_name, pred_index
     with tf.GradientTape() as tape:
         tape.watch(img_array_tensor)
         conv_outputs, predictions = grad_model(img_array_tensor)
+        # 支持多输出模型：如果 predictions 是列表/元组，取第一个输出作为分类预测
+        if isinstance(predictions, (list, tuple)):
+            predictions = predictions[0]
+
+        # 确保 predictions 为张量（处理可能的 numpy 输出）
+        predictions = tf.convert_to_tensor(predictions)
+
         if pred_index is None:
-            pred_index = tf.argmax(predictions[0])
+            # 将选取的索引转为 Python int，便于后续索引操作
+            pred_index = int(tf.argmax(predictions[0]).numpy())
         class_channel = predictions[:, pred_index]
 
     grads = tape.gradient(class_channel, conv_outputs)
@@ -629,7 +643,7 @@ def predict_v4():
 
     multilabel_threshold = _get_float("threshold", default=default_multilabel_threshold)
 
-    # 支持通用 min_val/max_val/alpha，如果未提供具体 coarse/amd 参数，则回退使用通用参数
+    # 支持通用 min_val/max_val/alpha，如果未提供具体 coarse 参数，则回退使用通用参数
     global_min_val = _get_float("min_val", default=None)
     global_max_val = _get_float("max_val", default=None)
     global_alpha   = _get_float("alpha",   default=None)
@@ -638,14 +652,10 @@ def predict_v4():
     coarse_max_val = _get_float("coarse_max_val", default=(global_max_val if global_max_val is not None else 1.0))
     coarse_alpha   = _get_float("coarse_alpha",   default=(global_alpha   if global_alpha   is not None else 0.6))
 
-    amd_min_val = _get_float("amd_min_val", default=(global_min_val if global_min_val is not None else 0.0))
-    amd_max_val = _get_float("amd_max_val", default=(global_max_val if global_max_val is not None else 1.0))
-    amd_alpha   = _get_float("amd_alpha",   default=(global_alpha   if global_alpha   is not None else 0.6))
-
     # 仅图片类型支持 fov（视场角）和眼球直径输入
     input_fov = _get_float("fov", default=45.0)
     eye_diameter_mm = _get_float("eye_diameter_mm", default=12.0)
-    logger.info(f"[v4] Params coarse(min={coarse_min_val}, max={coarse_max_val}, alpha={coarse_alpha}), amd(min={amd_min_val}, max={amd_max_val}, alpha={amd_alpha}), fov={input_fov}, eye_diameter_mm={eye_diameter_mm}")
+    logger.info(f"[v4] Params coarse(min={coarse_min_val}, max={coarse_max_val}, alpha={coarse_alpha}), fov={input_fov}, eye_diameter_mm={eye_diameter_mm}")
 
     dicom_meta = None
     pixel_spacing_x = None
@@ -686,82 +696,7 @@ def predict_v4():
     )
     logger.info(f"[v4] Coarse model: label={coarse_result['label']}, conf={coarse_result['confidence']:.6f}, lesion_px={coarse_result['lesion_px']}, lesion_mm2={coarse_result['lesion_mm2']:.6f}")
 
-    # AMD 分期模型预测（模型文件缺失时降级为单一 AMD 标签）
-    if amd_stage_model is None:
-        amd_stage_result = {
-            "status": "downgrade",
-            "message": "AMD stage model not available, returning AMD as single label",
-            "label": "amd",
-            "confidence": coarse_result["confidence"] if coarse_result["label"] == "amd" else None,
-            "lesion_px": coarse_result.get("lesion_px"),
-            "lesion_mm2": coarse_result.get("lesion_mm2"),
-            "lesion_region_count": coarse_result.get("lesion_region_count"),
-            "max_lesion_area_px": coarse_result.get("max_lesion_area_px"),
-            "max_lesion_area_mm2": coarse_result.get("max_lesion_area_mm2"),
-            "heatmap_base64": coarse_result.get("heatmap_base64"),
-        }
-    else:
-        img = load_img(img_path, target_size=(300,300))
-        img_array = img_to_array(img)
-        img_array = np.expand_dims(img_array, axis=0)
-        img_array = preprocess_input(img_array)
-
-        logger.info("[v4] Running AMD stage model prediction")
-        preds = amd_stage_model.predict(img_array)
-        predicted_idx = np.argmax(preds, axis=1)[0]
-        num_classes = preds.shape[1] if len(preds.shape) > 1 else preds.shape[0]
-        logger.info(f"[v4] Model output shape: {preds.shape}, num_classes: {num_classes}")
-        if predicted_idx >= len(amd_stage_classes):
-            logger.warning(f"[v4] predicted_idx {predicted_idx} >= len(amd_stage_classes) {len(amd_stage_classes)}, clamping to valid range")
-            predicted_idx = min(predicted_idx, len(amd_stage_classes) - 1)
-        predicted_label = amd_stage_classes[predicted_idx]
-        confidence = float(np.max(preds))
-        logger.info(f"[v4] AMD stage: label={predicted_label}, conf={confidence:.6f}")
-
-        base_model_layer, last_conv_layer_name = find_last_conv_layer_target(amd_stage_model)
-        logger.info(f"[v4] AMD stage last_conv_layer_name={last_conv_layer_name}")
-        if base_model_layer is None or last_conv_layer_name is None:
-            logger.warning("[v4] No Conv2D layer found in AMD stage model. Using zero heatmap.")
-            heatmap = np.zeros((img_array.shape[1], img_array.shape[2]), dtype=np.float32)
-        else:
-            heatmap = make_gradcam_heatmap(img_array, base_model_layer, last_conv_layer_name, predicted_idx)
-        max_val_local = np.max(heatmap)
-        heatmap = np.zeros_like(heatmap) if max_val_local == 0 else heatmap / max_val_local
-        logger.info(f"[v4] AMD heatmap stats: max={float(np.max(heatmap)):.6f}, min={float(np.min(heatmap)):.6f}, mean={float(np.mean(heatmap)):.6f}")
-        lesion_px = extract_lesion_area_px(heatmap, threshold=0.6)
-        heatmap_b64 = generate_heatmap_base64(img_path, heatmap, alpha=amd_alpha, min_val=amd_min_val, max_val=amd_max_val)
-
-        # AMD 分期病灶面积与连通域统计
-        if is_dicom:
-            mm2_per_px_amd = pixel_spacing_x * pixel_spacing_y
-            logger.info(f"[v4] AMD using DICOM mm2_per_px={mm2_per_px_amd:.6f}")
-        else:
-            img_cv = cv2.imread(img_path)
-            w = 1 if img_cv is None else img_cv.shape[1]
-            mm2_per_px_amd = (eye_diameter_mm * (input_fov / 45.0) / w) ** 2 if w != 0 else 0.0
-            logger.info(f"[v4] AMD using image mm2_per_px={mm2_per_px_amd:.6f}")
-
-        lesion_mm2 = lesion_px * mm2_per_px_amd if mm2_per_px_amd else 0.0
-        lesion_count, max_lesion_px, max_lesion_mm2 = analyze_lesion_regions(
-            heatmap, threshold=0.6, mm2_per_px=mm2_per_px_amd
-        )
-        logger.info(
-            f"[v4] AMD lesions: px={lesion_px}, mm2={lesion_mm2:.6f}, "
-            f"regions={lesion_count}, max_px={max_lesion_px}, max_mm2={max_lesion_mm2:.6f}"
-        )
-
-        amd_stage_result = {
-            "status": "ok",
-            "message": None,
-            "label": predicted_label,
-            "confidence": confidence,
-            "lesion_px": lesion_px,
-            "lesion_mm2": lesion_mm2,
-            "lesion_region_count": lesion_count,
-            "max_lesion_area_px": max_lesion_px,
-            "max_lesion_area_mm2": max_lesion_mm2,
-            "heatmap_base64": heatmap_b64
-        }
+    # AMD stage model not used in this deployment.
 
     if is_dicom:
         coarse_result["lesion_mm2"] = coarse_result["lesion_px"] * pixel_spacing_x * pixel_spacing_y
@@ -773,7 +708,6 @@ def predict_v4():
         "mode": "dicom" if is_dicom else "image",
         "dicom_metadata": dicom_meta,
         "coarse_model": coarse_result,
-        "amd_stage_model": amd_stage_result,
         "pixel_spacing_x_mm": pixel_spacing_x,
         "pixel_spacing_y_mm": pixel_spacing_y,
         "model_version": model_version,

@@ -224,3 +224,7 @@ uploads/*
 best_amd_resnet50_finetune.keras
 best_amd_resnet50.keras
 eye_disease_model.keras
+best_eye_disease_model_3cls_ft.keras
+.gitignore
+vgg16_model.keras
+best_eye_disease_model_ft.keras
